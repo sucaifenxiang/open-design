@@ -949,17 +949,6 @@ function extractJsonEventText(kind, raw, agentName) {
 }
 
 async function callLocalCli(provider, system, user, options) {
-  if (typeof options?.localCliRunner === 'function') {
-    return options.localCliRunner({
-      agentId: provider.agentId,
-      model: provider.model,
-      system,
-      user,
-      projectRoot: options?.projectRoot ?? null,
-      dataDir: options?.dataDir ?? null,
-    });
-  }
-
   const def = getAgentDef(provider.agentId);
   if (!def) {
     throw new Error(`Local CLI agent "${provider.agentId}" is not installed`);
@@ -971,6 +960,32 @@ async function callLocalCli(provider, system, user, options) {
     configuredAgentEnv = agentCliEnvForAgent(appConfig.agentCliEnv, def.id);
   } catch {
     configuredAgentEnv = {};
+  }
+  const configuredSecrets = Object.entries({
+    ...process.env,
+    ...configuredAgentEnv,
+  })
+    .filter(([key, value]) => (
+      /(API_KEY|AUTH_TOKEN|RUNTIME_KEY|ACCESS_TOKEN|SECRET_ACCESS_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY)$/i.test(key)
+      && typeof value === 'string'
+      && value.length > 0
+    ))
+    .map(([, value]) => value);
+
+  if (typeof options?.localCliRunner === 'function') {
+    try {
+      const text = await options.localCliRunner({
+        agentId: provider.agentId,
+        model: provider.model,
+        system,
+        user,
+        projectRoot: options?.projectRoot ?? null,
+        dataDir: options?.dataDir ?? null,
+      });
+      return { text, sensitiveValues: configuredSecrets };
+    } catch (error) {
+      throw redactProviderError(error, provider, configuredSecrets);
+    }
   }
 
   const launch = resolveAgentLaunch(def, configuredAgentEnv);
@@ -990,7 +1005,7 @@ async function callLocalCli(provider, system, user, options) {
   const prompt = [
     system,
     '',
-    'You are running as a background memory extractor. Do not use tools. Return strict JSON only.',
+    'You are running as a background structured-JSON task. Do not use tools. Return strict JSON only.',
     '',
     user,
   ].join('\n');
@@ -1093,15 +1108,19 @@ async function callLocalCli(provider, system, user, options) {
         try {
           text = parseStdout(stdout);
         } catch (err) {
-          finish(err);
+          finish(redactProviderError(err, provider, configuredSecrets));
           return;
         }
         if (text) {
-          finish(null, text);
+          finish(null, { text, sensitiveValues: configuredSecrets });
           return;
         }
       }
-      const detail = (stderr.trim() || stdout.trim() || 'no output').slice(0, 1000);
+      const rawDetail = (stderr.trim() || stdout.trim() || 'no output').slice(0, 1000);
+      const detail = configuredSecrets.reduce(
+        (text, secret) => text.split(secret).join('[REDACTED]'),
+        rawDetail,
+      );
       const status = signal ? `signal ${signal}` : `exit ${code}`;
       finish(new Error(`${def.name} CLI ${status}: ${detail}`));
     });
@@ -1110,6 +1129,72 @@ async function callLocalCli(provider, system, user, options) {
     });
     child.stdin.end(stdinText);
   });
+}
+
+function redactProviderError(error, provider, sensitiveValues = []) {
+  const raw = error?.message || String(error);
+  const apiKey =
+    typeof provider?.apiKey === 'string' ? provider.apiKey.trim() : '';
+  const exactValues = [apiKey, ...sensitiveValues].filter(Boolean);
+  const redacted = exactValues.reduce(
+    (text, value) => text.split(value).join('[REDACTED]'),
+    raw,
+  )
+    .replace(
+      /((?:api[_-]?key|auth[_-]?token|access[_-]?token|authorization)\s*[:=]\s*)[^\s,;]+/gi,
+      '$1[REDACTED]',
+    )
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]');
+  return new Error(redacted);
+}
+
+// Shared provider transport used by memory extraction and other daemon-owned
+// strict-JSON tasks. Provider selection deliberately reuses pickProvider so
+// Local CLI, chat BYOK, env, and media-config precedence cannot drift.
+export async function generateConfiguredJsonTextWithMetadata(request, options = {}) {
+  const projectRoot = options?.projectRoot ?? null;
+  const dataDir = options?.dataDir ?? null;
+  const provider = options?.provider ?? await pickProvider(
+    projectRoot,
+    options?.useMemoryConfig === true ? dataDir : null,
+    request?.chatAgentId ?? options?.chatAgentId ?? null,
+    options?.chatProvider ?? null,
+    options?.chatModel ?? null,
+  );
+  if (!provider) return null;
+  try {
+    if (provider.transport === 'chat-cli') {
+      return await callLocalCli(provider, request.system, request.user, {
+        dataDir,
+        projectRoot,
+        localCliRunner: options?.localCliRunner,
+      });
+    }
+    let text;
+    if (provider.kind === 'anthropic') {
+      text = await callAnthropic(provider, request.system, request.user);
+    } else if (provider.kind === 'azure') {
+      text = await callAzure(provider, request.system, request.user);
+    } else if (provider.kind === 'google') {
+      text = await callGoogle(provider, request.system, request.user);
+    } else {
+      text = await callOpenAI(provider, request.system, request.user);
+    }
+    return {
+      text,
+      sensitiveValues: typeof provider.apiKey === 'string' && provider.apiKey
+        ? [provider.apiKey]
+        : [],
+    };
+  } catch (error) {
+    throw redactProviderError(error, provider);
+  }
+}
+
+export async function generateConfiguredJsonText(request, options = {}) {
+  const result = await generateConfiguredJsonTextWithMetadata(request, options);
+  return result?.text ?? null;
 }
 
 // Tolerant JSON parse — the model occasionally wraps output in ```json
@@ -1312,24 +1397,19 @@ async function collectProposedEntries(dataDir, input, options) {
 
   let raw = '';
   try {
-    if (provider.transport === 'chat-cli') {
-      raw = await callLocalCli(provider, systemPrompt, userPayload, {
+    raw = await generateConfiguredJsonText(
+      {
+        system: systemPrompt,
+        user: userPayload,
+        chatAgentId,
+      },
+      {
+        provider,
         dataDir,
         projectRoot,
         localCliRunner: options?.localCliRunner,
-      });
-    } else if (provider.kind === 'anthropic') {
-      raw = await callAnthropic(provider, systemPrompt, userPayload);
-    } else if (provider.kind === 'azure') {
-      raw = await callAzure(provider, systemPrompt, userPayload);
-    } else if (provider.kind === 'google') {
-      raw = await callGoogle(provider, systemPrompt, userPayload);
-    } else {
-      // openai or ollama — both speak the OpenAI chat-completions
-      // wire shape, so callOpenAI handles them with just a different
-      // base URL.
-      raw = await callOpenAI(provider, systemPrompt, userPayload);
-    }
+      },
+    );
   } catch (err) {
     // err.message is already pre-formatted by describeFetchError() when
     // the call layer caught a network error. For HTTP-level failures
